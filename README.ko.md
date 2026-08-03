@@ -14,7 +14,6 @@
 | --- | --- |
 | `fix-nvidia-340.sh` | `nvidia-340` 패키지 설치를 완료시킴 |
 | `set-mac-boot-splash.sh` | 맥 스타일 부팅 화면 + 부팅 시간 단축 |
-| `prune-efi-entries.sh` | EFI 부트 항목 정리, shim 건너뛰기 |
 | `get-mint-iso.sh` | 가장 빠른 미러에서 Mint ISO 다운로드 |
 
 ## `fix-nvidia-340.sh`
