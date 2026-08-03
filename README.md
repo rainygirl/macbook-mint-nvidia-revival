@@ -14,7 +14,6 @@ Everything they change is backed up and reversible.
 | --- | --- |
 | `fix-nvidia-340.sh` | Makes the `nvidia-340` package finish installing |
 | `set-mac-boot-splash.sh` | Mac-style boot screen, and boot-time reductions |
-| `prune-efi-entries.sh` | Cleans up EFI boot entries, skips shim |
 | `get-mint-iso.sh` | Downloads a Mint ISO from the fastest mirror |
 
 ## `fix-nvidia-340.sh`
