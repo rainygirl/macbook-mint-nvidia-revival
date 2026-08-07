@@ -132,6 +132,54 @@ else
     info "EnableBrightnessControl is NOT set -- nvidia_backlight will not appear"
 fi
 
+log "apple_bl bind status"
+# apple_bl_add() drives the panel through the host bridge at 00:00.0 -- which on a
+# MacBook7,1 is an NVIDIA MCP89, one of the two vendors it handles -- but it bails out
+# with -ENODEV before that if acpi_video_get_backlight_type() != acpi_backlight_vendor,
+# logging "Backlight handled by ACPI video driver". acpi_backlight=vendor is what flips
+# that decision, and it is what --acpi-vendor adds.
+info "host bridge 00:00.0: $(lspci -nn -s 00:00.0 2>/dev/null | sed 's/^[^ ]* //' || echo '?')"
+case " $(cat /proc/cmdline) " in
+    *" acpi_backlight="*) info "cmdline already has $(tr ' ' '\n' < /proc/cmdline | grep '^acpi_backlight=')" ;;
+    *) info "cmdline has no acpi_backlight= (ACPI video wins by default)" ;;
+esac
+apple_msg=$(dmesg 2>/dev/null | grep -i 'apple_bl' | tail -3 || true)
+if [ -n "$apple_msg" ]; then
+    printf '%s\n' "$apple_msg" | sed 's/^/     /'
+    case "$apple_msg" in
+        *"handled by ACPI video"*)
+            warn "this is the blocker -- re-run with --acpi-vendor" ;;
+        *"unknown hardware"*)
+            warn "apple_bl does not recognise this host bridge; --acpi-vendor will not help" ;;
+    esac
+else
+    info "no apple_bl messages in dmesg (module may not have been loaded yet this boot)"
+fi
+
+log "nvidia driver brightness support"
+NVDRV=$(ls /usr/lib/nvidia-*/xorg/nvidia_drv.so \
+           /usr/lib/x86_64-linux-gnu/nvidia/xorg/nvidia_drv.so 2>/dev/null | head -1 || true)
+if [ -n "$NVDRV" ] && command -v strings >/dev/null 2>&1; then
+    nv_bl=$(strings "$NVDRV" | grep -iE 'EnableBrightnessControl|backlight' | head -5 || true)
+    if [ -n "$nv_bl" ]; then
+        printf '%s\n' "$nv_bl" | sed 's/^/     /'
+    else
+        warn "$(basename "$NVDRV") has no brightness/backlight strings"
+        warn "-> 340.108 cannot create nvidia_backlight here; apple_bl is the only path"
+    fi
+else
+    info "skipped (nvidia_drv.so or 'strings' not found)"
+fi
+if [ -f /var/log/Xorg.0.log ]; then
+    xlog=$(grep -iE 'RegistryDwords|BrightnessControl|backlight' /var/log/Xorg.0.log 2>/dev/null | head -5 || true)
+    if [ -n "$xlog" ]; then
+        printf '%s\n' "$xlog" | sed 's/^/     /'
+    else
+        info "Xorg.0.log mentions neither RegistryDwords nor backlight"
+        info "-> the running X server is not acting on the option"
+    fi
+fi
+
 log "hid_apple fnmode"
 fnmode=$(cat /sys/module/hid_apple/parameters/fnmode 2>/dev/null || echo '?')
 case "$fnmode" in
