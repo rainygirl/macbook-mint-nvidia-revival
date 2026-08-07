@@ -274,6 +274,81 @@ def cmd_sweep(bar, secs, start):
     print("  sudo %s --test 0xADDR --off 0xNN" % sys.argv[0])
 
 
+# Wide enough to cover PMC/PTIMER low registers and the whole PDISPLAY aperture.
+DIFF_BLOCKS = ((0x000000, 0x020000), (0x600000, 0x680000))
+
+
+def snapshot(bar, blocks):
+    snap = {}
+    for lo, hi in blocks:
+        for reg in range(lo, hi, 4):
+            snap[reg] = bar.rd(reg)
+    return snap
+
+
+def find_backlight():
+    for d in sorted(glob.glob("/sys/class/backlight/*")):
+        if os.path.exists(os.path.join(d, "brightness")):
+            return d
+    return None
+
+
+def cmd_diff(bar):
+    """Identify the backlight register by differencing, with a driver that already
+    works, instead of guessing at nouveau's constants.
+
+    A control pass first: snapshot twice with nothing changed and discard every
+    register that moved on its own. PTIMER and the performance counters tick
+    constantly and would otherwise swamp the real hit."""
+    require_live(bar)
+    dev = find_backlight()
+    if not dev:
+        sys.exit("no /sys/class/backlight device.\n"
+                 "Boot with nouveau driving the GPU first -- this mode needs a working\n"
+                 "backlight to watch. See boot-nouveau-probe.sh --arm.")
+    print("watching %s" % dev)
+    with open(os.path.join(dev, "max_brightness")) as f:
+        maxb = int(f.read().strip())
+    with open(os.path.join(dev, "brightness")) as f:
+        orig = int(f.read().strip())
+    print("max_brightness = %d, current = %d" % (maxb, orig))
+
+    def set_b(v):
+        with open(os.path.join(dev, "brightness"), "w") as f:
+            f.write(str(v))
+
+    print("\ncontrol pass (nothing changed) ...")
+    s0 = snapshot(bar, DIFF_BLOCKS)
+    time.sleep(0.5)
+    s1 = snapshot(bar, DIFF_BLOCKS)
+    noisy = {r for r in s0 if s0[r] != s1[r]}
+    print("  %d registers move on their own; ignoring them" % len(noisy))
+
+    low = max(1, maxb // 5)
+    print("\nsetting brightness %d -> %d ..." % (orig, low))
+    try:
+        set_b(low)
+        time.sleep(0.5)
+        s2 = snapshot(bar, DIFF_BLOCKS)
+    finally:
+        set_b(orig)
+        print("restored brightness to %d" % orig)
+
+    hits = [(r, s1[r], s2[r]) for r in sorted(s1)
+            if r not in noisy and s1[r] != s2[r]]
+    print("\n%d register(s) changed with brightness:\n" % len(hits))
+    for r, before, after in hits:
+        print("  0x%06x  0x%08x -> 0x%08x   (low16 %5d -> %5d)"
+              % (r, before, after, before & 0xFFFF, after & 0xFFFF))
+    if not hits:
+        print("  none -- the backlight is not driven through this BAR")
+        return
+    print("\nNeighbours of each hit, to spot the period register:")
+    for r, _b, _a in hits:
+        for off in (0x00, 0x04, 0x84):
+            print("    0x%06x+0x%02x = 0x%08x" % (r, off, bar.rd(r + off)))
+
+
 def load_conf():
     reg, off = DEFAULT_DUTY_REG, 0x04
     try:
@@ -313,6 +388,9 @@ def main():
     g.add_argument("--pairs", action="store_true", help="read-only: PWM-shaped pairs")
     g.add_argument("--test", metavar="REG", help="drive one candidate, then restore it")
     g.add_argument("--sweep", action="store_true", help="try every candidate in turn")
+    g.add_argument("--diff", action="store_true",
+                   help="find the register by changing a working backlight and "
+                        "differencing (run this under nouveau)")
     g.add_argument("--get", action="store_true")
     g.add_argument("--set", type=int, metavar="PCT")
     g.add_argument("--up", action="store_true")
@@ -337,6 +415,8 @@ def main():
             return cmd_test(bar, int(a.test, 0), off, a.secs)
         if a.sweep:
             return cmd_sweep(bar, a.secs, a.start)
+        if a.diff:
+            return cmd_diff(bar)
 
         require_live(bar)
         reg = int(a.reg, 0) if a.reg else conf_reg
