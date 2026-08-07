@@ -13,6 +13,7 @@ Everything they change is backed up and reversible.
 | Script | Role |
 | --- | --- |
 | `fix-nvidia-340.sh` | Makes the `nvidia-340` package finish installing |
+| `fix-brightness-keys.sh` | Restores the F1/F2 panel-brightness keys after the driver switch |
 | `set-mac-boot-splash.sh` | Mac-style boot screen, and boot-time reductions |
 | `get-mint-iso.sh` | Downloads a Mint ISO from the fastest mirror |
 
@@ -38,6 +39,33 @@ the GPU. The `09_` prefix matters: emitted before GRUB switches to gfxterm they 
 rendering into a framebuffer that is no longer scanned out.
 
 Run as root. Takes 5-10 minutes — it builds the module for each kernel.
+
+## `fix-brightness-keys.sh`
+
+F1/F2 stop dimming the panel once nvidia-340 replaces nouveau. The keys are fine; what
+disappears is the thing they act on. nouveau's KMS driver registers
+`/sys/class/backlight/nv_backlight` and xfce4-power-manager writes to it directly.
+nvidia-340 blacklists nouveau and registers a KMS-less DRM node instead — the same
+property that makes plymouth's drm renderer fail — so there is no `nv_backlight`, nothing
+replaces it, and the desktop ends up with no backlight device at all.
+
+340.108 can expose `/sys/class/backlight/nvidia_backlight`, but only with
+`Option "RegistryDwords" "EnableBrightnessControl=1"` in the Device section. Neither the
+package nor the `xorg.conf` that `set-mac-boot-splash.sh` writes for `LogoPath`/`NoLogo`
+includes it. This script adds it to the Device section the *Screen* references — a second
+Device section is demoted to `GPUDevice` and its options are never read.
+
+It also loads `apple_bl` (the in-tree nvidia-bl; it drives the 320M panel over mmio
+regardless of which X driver owns the GPU, and unlike the `xorg.conf` change it takes
+effect without restarting X), makes the `brightness` file group-writable through udev
+(both nodes come up `0644 root:root`, and a write that fails with `EACCES` is
+indistinguishable from a dead key), installs `mac-brightness` bound to
+`XF86MonBrightnessUp/Down` for when xfce4-power-manager still refuses the device, and
+checks `hid_apple`'s `fnmode`, which decides whether F1 emits the brightness keysym at all.
+
+`--diagnose` reports the state and changes nothing, no root needed. `--acpi-vendor` adds
+`acpi_backlight=vendor` if the ACPI video driver is holding the backlight away from
+`apple_bl`. `--revert` undoes everything.
 
 ## `set-mac-boot-splash.sh`
 

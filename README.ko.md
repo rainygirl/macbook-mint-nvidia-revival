@@ -13,6 +13,7 @@
 | 스크립트 | 역할 |
 | --- | --- |
 | `fix-nvidia-340.sh` | `nvidia-340` 패키지 설치를 완료시킴 |
+| `fix-brightness-keys.sh` | 드라이버 교체 후 죽은 F1/F2 밝기 키 복구 |
 | `set-mac-boot-splash.sh` | 맥 스타일 부팅 화면 + 부팅 시간 단축 |
 | `get-mint-iso.sh` | 가장 빠른 미러에서 Mint ISO 다운로드 |
 
@@ -37,6 +38,32 @@ Command 레지스터를 세팅하는 GRUB `setpci` 명령을 내보냅니다. �
 스캔아웃되지 않는 프레임버퍼에 그리게 됩니다.
 
 root로 실행. 커널마다 모듈을 빌드하므로 5~10분 걸립니다.
+
+## `fix-brightness-keys.sh`
+
+nouveau가 nvidia-340으로 바뀌면 F1/F2가 밝기를 못 바꿉니다. 키가 죽은 게 아니라 키가 조작할
+대상이 사라진 것입니다. nouveau의 KMS 드라이버는 `/sys/class/backlight/nv_backlight`를
+등록하고 xfce4-power-manager가 거기에 직접 씁니다. nvidia-340은 nouveau를 블랙리스트에 넣고
+대신 KMS 없는 DRM 노드를 등록합니다 -- plymouth의 drm 렌더러가 실패하는 것과 같은 이유입니다.
+그래서 `nv_backlight`가 없어지고, 대신 들어오는 것도 없어서 데스크톱에 backlight 장치가 하나도
+남지 않습니다.
+
+340.108도 `/sys/class/backlight/nvidia_backlight`를 만들 수 있지만 Device 섹션에
+`Option "RegistryDwords" "EnableBrightnessControl=1"`이 있어야 합니다. 패키지에도,
+`set-mac-boot-splash.sh`가 `LogoPath`/`NoLogo` 때문에 쓰는 `xorg.conf`에도 그게 없습니다. 이
+스크립트는 *Screen*이 참조하는 Device 섹션에 그것을 넣습니다 -- 두 번째 Device 섹션은
+`GPUDevice`로 강등되어 옵션이 아예 읽히지 않습니다.
+
+같이 하는 일: `apple_bl` 로드(커널 내장 nvidia-bl. 어느 X 드라이버가 GPU를 잡고 있든 mmio로
+320M 패널을 직접 다루고, `xorg.conf` 변경과 달리 X 재시작 없이 바로 먹습니다), udev로
+`brightness` 파일을 그룹 쓰기 가능하게(두 노드 모두 `0644 root:root`로 올라오는데, `EACCES`로
+실패한 쓰기는 죽은 키와 구분이 안 됩니다), xfce4-power-manager가 그래도 장치를 안 받을 때를
+위해 `mac-brightness`를 `XF86MonBrightnessUp/Down`에 바인딩, 그리고 F1이 밝기 키심을 내보내는지
+자체를 결정하는 `hid_apple`의 `fnmode` 확인.
+
+`--diagnose`는 상태만 출력하고 아무것도 바꾸지 않습니다 (root 불필요). ACPI video 드라이버가
+backlight를 쥐고 `apple_bl`에 안 넘길 때는 `--acpi-vendor`로 `acpi_backlight=vendor`를
+추가합니다. `--revert`로 전부 되돌립니다.
 
 ## `set-mac-boot-splash.sh`
 
