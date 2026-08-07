@@ -11,26 +11,28 @@ Neither driver that would normally own this panel does:
     no log message when that port does not answer. Its own comment says "this may not
     work under EFI", which is how this machine boots.
 
-So the GPU register gets driven directly, the way nouveau would. Reaching it does not
-need /dev/mem: the kernel exports each PCI BAR as an mmap-able file under
-/sys/bus/pci/devices/<addr>/resourceN, which is not subject to iomem=strict.
+So the GPU register is driven directly, the way nouveau would. Reaching it needs no
+/dev/mem: the kernel exports each PCI BAR as an mmap-able file under
+/sys/bus/pci/devices/<addr>/resourceN, outside iomem=strict.
 
---probe is read-only and prints a survey rather than one guess, because the backlight
-register moved across Tesla revisions and the 320M sits near that boundary:
+Reads and writes go through a ctypes uint32 array over the mapping rather than Python
+slicing -- slicing copies via memcpy, which may use byte-sized loads, and MMIO wants
+aligned 32-bit accesses.
 
-    PMC_BOOT_0        0x000000            chipset id -- proves the mapping is live
-    NV40_PMC_BACKLIGHT 0x0015f0           pre-nv50 location, still used by some parts
-    nv50   level      0x61c880 + or*0x800   mask 0x00000fff, divisor is a fixed 1025
-    nva3   level      0x61c880 + or*0x800   mask 0x00ffffff, divisor at +0x84
+The register is found, not assumed. nouveau's constant for Tesla is 0x61c880 + or*0x800
+with the divisor at +0x84, but that reads 0 on this part while an identically shaped pair
+sits 0x800 lower:
 
-Reads go through a ctypes uint32 array over the mapping, not Python slicing: slicing
-copies through memcpy, which is free to use byte-sized loads, and MMIO wants aligned
-32-bit accesses.
+    0x61c080 = 0x00005fed      duty
+    0x61c084 = 0x40005fed      enable | period
 
-  sudo ./nv-backlight.py --probe          # read-only survey, changes nothing
-  sudo ./nv-backlight.py --get
-  sudo ./nv-backlight.py --set 60
-  sudo ./nv-backlight.py --up / --down
+so --pairs looks for that shape across the display block instead, and --test proves a
+candidate by driving it and putting it back.
+
+  sudo ./nv-backlight.py --probe             # read-only survey
+  sudo ./nv-backlight.py --pairs             # read-only: find PWM-shaped register pairs
+  sudo ./nv-backlight.py --test 0x61c080     # dim, hold, restore -- always restores
+  sudo ./nv-backlight.py --get / --set 60 / --up / --down
 """
 
 import argparse
@@ -38,20 +40,24 @@ import ctypes
 import glob
 import mmap
 import os
+import signal
 import sys
+import time
 
 PMC_BOOT_0 = 0x000000
 NV40_PMC_BACKLIGHT = 0x0015F0
-SOR_BACKLIGHT = 0x61C880
+NOUVEAU_SOR_BACKLIGHT = 0x61C880   # what nouveau uses on Tesla; 0 on this part
 SOR_STRIDE = 0x800
 NUM_OR = 4
+NVA3_DIV_OFFSET = 0x84
 ENABLE = 0x80000000
 USE_DIVISOR = 0x40000000
-NV50_LEVEL_MASK = 0x00000FFF
-NVA3_LEVEL_MASK = 0x00FFFFFF
-NV50_FIXED_DIV = 1025
-NVA3_DIV_OFFSET = 0x84
-STATE = "/var/lib/nv-backlight.level"
+DISPLAY_BLOCK = (0x61C000, 0x61E000)
+PMC_BLOCK = (0x001500, 0x001700)
+
+# Filled in by --test / set from a config file once confirmed.
+CONF = "/etc/nv-backlight.conf"
+DEFAULT_DUTY_REG = 0x61C080
 
 
 def find_gpu():
@@ -77,15 +83,11 @@ def bar0_size(gpu):
 
 
 class Bar0:
-    """The whole of BAR0, as a uint32 array. Mapped PROT_WRITE so ctypes can build a
-    real array over it (from_buffer needs a writable buffer); --probe and --get never
-    assign to it."""
-
     def __init__(self, gpu):
         self.path = "/sys/bus/pci/devices/%s/resource0" % gpu
         if not os.path.exists(self.path):
             sys.exit("%s does not exist" % self.path)
-        size = bar0_size(gpu)
+        self.size = bar0_size(gpu)
         try:
             self.fd = os.open(self.path, os.O_RDWR | os.O_SYNC)
         except PermissionError:
@@ -93,14 +95,13 @@ class Bar0:
         except OSError as e:
             sys.exit("cannot open %s: %s" % (self.path, e))
         try:
-            self.m = mmap.mmap(self.fd, size, mmap.MAP_SHARED,
+            self.m = mmap.mmap(self.fd, self.size, mmap.MAP_SHARED,
                                mmap.PROT_READ | mmap.PROT_WRITE)
         except OSError as e:
             sys.exit("mmap of %s failed: %s\n"
                      "The BAR may be claimed exclusively; boot with iomem=relaxed."
                      % (self.path, e))
-        self.u32 = (ctypes.c_uint32 * (size // 4)).from_buffer(self.m)
-        self.size = size
+        self.u32 = (ctypes.c_uint32 * (self.size // 4)).from_buffer(self.m)
 
     def rd(self, reg):
         return self.u32[reg >> 2]
@@ -116,10 +117,35 @@ class Bar0:
 
 def check_live(bar):
     """PMC_BOOT_0 is never 0 on a powered GPU. If it reads 0 the mapping is not
-    reaching the hardware, and every other 0 in the dump means nothing."""
+    reaching the hardware and every other 0 means nothing."""
     boot0 = bar.rd(PMC_BOOT_0)
-    chipset = (boot0 & 0x1FF00000) >> 20
-    return boot0, chipset
+    return boot0, (boot0 & 0x1FF00000) >> 20
+
+
+def require_live(bar):
+    boot0, chipset = check_live(bar)
+    if boot0 == 0:
+        sys.exit("PMC_BOOT_0 reads 0 -- the mapping is not reaching the GPU")
+    return chipset
+
+
+def find_pairs(bar, block):
+    """Registers X where X and X+4 share their low 16 bits and X+4 carries a high
+    control bit. That is the shape of a PWM (duty, enable|period) pair, and it is how
+    the working register was identified on this machine."""
+    lo, hi = block
+    out = []
+    for reg in range(lo, hi, 4):
+        a = bar.rd(reg)
+        b = bar.rd(reg + 4)
+        if not a or not b:
+            continue
+        if (a & 0xFFFF) != (b & 0xFFFF):
+            continue
+        if not (b & 0xF0000000):
+            continue
+        out.append((reg, a, b))
+    return out
 
 
 def cmd_probe(bar):
@@ -127,78 +153,102 @@ def cmd_probe(bar):
     print("BAR0 %s, %d MB" % (bar.path, bar.size >> 20))
     print("PMC_BOOT_0 (0x000000) = 0x%08x   chipset = 0x%02x" % (boot0, chipset))
     if boot0 == 0:
-        print("\n  PMC_BOOT_0 reads 0. The mapping is NOT reaching the GPU, so the")
-        print("  zeros below are meaningless. Nothing here is safe to write.")
+        print("\n  Mapping is NOT reaching the GPU. Every zero below is meaningless.")
         return
-    print("  (0xaf = MCP89/NVAF, the 320M. Non-zero means the mapping is live.)")
-
+    print("  (0xaf = MCP89/NVAF, the 320M)")
     print("\nNV40_PMC_BACKLIGHT 0x0015f0 = 0x%08x" % bar.rd(NV40_PMC_BACKLIGHT))
 
-    print("\nSOR backlight registers")
-    print("  %-4s %-12s %-12s %-12s" % ("OR", "0x61c880+", "+0x04", "+0x84 (nva3 div)"))
+    print("\nnouveau's Tesla location, for reference")
+    print("  %-4s %-12s %-12s" % ("OR", "0x61c880+", "+0x84 (div)"))
     for or_ in range(NUM_OR):
-        base = SOR_BACKLIGHT + or_ * SOR_STRIDE
-        print("  %-4d 0x%08x   0x%08x   0x%08x"
-              % (or_, bar.rd(base), bar.rd(base + 4), bar.rd(base + NVA3_DIV_OFFSET)))
-
-    print("\nNon-zero words in 0x61c000-0x61e000 (the PDISPLAY SOR block)")
-    hits = 0
-    for reg in range(0x61C000, 0x61E000, 4):
-        val = bar.rd(reg)
-        if val:
-            print("    0x%06x = 0x%08x" % (reg, val))
-            hits += 1
-            if hits >= 40:
-                print("    ... (truncated at 40)")
-                break
-    if not hits:
-        print("    none -- the display engine block is entirely zero")
-
-    print("\nNon-zero words in 0x001500-0x001700 (the PMC backlight block)")
-    hits = 0
-    for reg in range(0x1500, 0x1700, 4):
-        val = bar.rd(reg)
-        if val:
-            print("    0x%06x = 0x%08x" % (reg, val))
-            hits += 1
-    if not hits:
-        print("    none")
+        base = NOUVEAU_SOR_BACKLIGHT + or_ * SOR_STRIDE
+        print("  %-4d 0x%08x   0x%08x" % (or_, bar.rd(base),
+                                          bar.rd(base + NVA3_DIV_OFFSET)))
+    cmd_pairs(bar)
 
 
-def read_level(bar, or_):
-    """Try the nva3 layout first (divisor at +0x84); fall back to nv50's fixed 1025."""
-    base = SOR_BACKLIGHT + or_ * SOR_STRIDE
-    ctrl = bar.rd(base)
-    div = bar.rd(base + NVA3_DIV_OFFSET)
-    if div:
-        val = ctrl & NVA3_LEVEL_MASK
-        return round(val * 100 / div), div, NVA3_LEVEL_MASK
-    val = ctrl & NV50_LEVEL_MASK
-    return round(val * 100 / NV50_FIXED_DIV), NV50_FIXED_DIV, NV50_LEVEL_MASK
+def cmd_pairs(bar):
+    require_live(bar)
+    for name, block in (("display 0x61c000-0x61e000", DISPLAY_BLOCK),
+                        ("PMC 0x001500-0x001700", PMC_BLOCK)):
+        print("\nPWM-shaped register pairs in %s" % name)
+        pairs = find_pairs(bar, block)
+        if not pairs:
+            print("    none")
+            continue
+        for reg, a, b in pairs:
+            duty, period = a & 0xFFFF, b & 0xFFFF
+            pct = round(duty * 100 / period) if period else 0
+            print("    0x%06x = 0x%08x   0x%06x = 0x%08x   duty/period = %d/%d = %d%%"
+                  % (reg, a, reg + 4, b, duty, period, pct))
+        print("    -> confirm one with: sudo %s --test 0x%06x"
+              % (sys.argv[0], pairs[0][0]))
 
 
-def find_or(bar):
-    out = []
-    for or_ in range(NUM_OR):
-        base = SOR_BACKLIGHT + or_ * SOR_STRIDE
-        ctrl = bar.rd(base)
-        if ctrl & ENABLE:
-            out.append(or_)
-    return out
+def cmd_test(bar, reg, secs):
+    """Drive a candidate and put it back. The original value is restored from a finally
+    block and from SIGINT/SIGTERM handlers, so Ctrl-C during the hold still restores.
+    These registers are volatile -- a reboot clears any mess regardless."""
+    require_live(bar)
+    orig = bar.rd(reg)
+    period = bar.rd(reg + 4) & 0xFFFF
+    print("0x%06x = 0x%08x   0x%06x = 0x%08x  (period %d)"
+          % (reg, orig, reg + 4, bar.rd(reg + 4), period))
+    if not period:
+        sys.exit("period at 0x%06x is 0 -- refusing to write" % (reg + 4))
 
+    restored = [False]
 
-def set_level(bar, or_, pct):
-    # Never 0: a black panel can only be undone by the very key being debugged.
-    pct = max(1, min(100, int(pct)))
-    base = SOR_BACKLIGHT + or_ * SOR_STRIDE
-    _cur, div, mask = read_level(bar, or_)
-    val = round(pct * div / 100)
-    bar.wr(base, ENABLE | USE_DIVISOR | (val & mask))
+    def restore(*_a):
+        if not restored[0]:
+            bar.wr(reg, orig)
+            restored[0] = True
+            print("\nrestored 0x%06x = 0x%08x" % (reg, orig))
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_a: (restore(), sys.exit(1)))
+
     try:
-        with open(STATE, "w") as f:
-            f.write(str(pct))
+        print("\nWatch the panel. Each step is held %ds.\n" % secs)
+        for pct in (70, 40, 15):
+            val = (orig & ~0xFFFF) | int(period * pct / 100)
+            bar.wr(reg, val)
+            print("  %3d%%  wrote 0x%08x" % (pct, val))
+            time.sleep(secs)
+    finally:
+        restore()
+
+    print("\nIf the panel dimmed and came back, this is the register.")
+    print("Record it with:  echo 'duty_reg=0x%06x' | sudo tee %s" % (reg, CONF))
+    print("If nothing changed, nothing was left altered -- try the next candidate.")
+
+
+def duty_reg():
+    try:
+        with open(CONF) as f:
+            for line in f:
+                if line.strip().startswith("duty_reg="):
+                    return int(line.split("=", 1)[1].strip(), 0)
     except OSError:
         pass
+    return DEFAULT_DUTY_REG
+
+
+def get_pct(bar, reg):
+    period = bar.rd(reg + 4) & 0xFFFF
+    if not period:
+        sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + 4))
+    return round((bar.rd(reg) & 0xFFFF) * 100 / period)
+
+
+def set_pct(bar, reg, pct):
+    # Never 0: a black panel can only be undone by the very key being debugged.
+    pct = max(5, min(100, int(pct)))
+    period = bar.rd(reg + 4) & 0xFFFF
+    if not period:
+        sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + 4))
+    cur = bar.rd(reg)
+    bar.wr(reg, (cur & ~0xFFFF) | int(period * pct / 100))
     return pct
 
 
@@ -206,36 +256,35 @@ def main():
     p = argparse.ArgumentParser()
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--probe", action="store_true", help="read-only survey")
+    g.add_argument("--pairs", action="store_true", help="read-only: PWM-shaped pairs")
+    g.add_argument("--test", metavar="REG", help="drive a candidate, then restore it")
     g.add_argument("--get", action="store_true")
     g.add_argument("--set", type=int, metavar="PCT")
     g.add_argument("--up", action="store_true")
     g.add_argument("--down", action="store_true")
     p.add_argument("--step", type=int, default=10)
-    p.add_argument("--or", dest="or_", type=int, default=None)
+    p.add_argument("--secs", type=int, default=3, help="hold per step for --test")
+    p.add_argument("--reg", help="override the duty register (default from %s)" % CONF)
     a = p.parse_args()
 
     bar = Bar0(find_gpu())
     try:
         if a.probe:
-            cmd_probe(bar)
-            return
-        boot0, _ = check_live(bar)
-        if boot0 == 0:
-            sys.exit("PMC_BOOT_0 reads 0 -- the mapping is dead, refusing to write")
-        if a.or_ is not None:
-            or_ = a.or_
-        else:
-            live = find_or(bar)
-            if not live:
-                sys.exit("no SOR has the backlight enable bit set -- run --probe first")
-            or_ = live[0]
-        cur, _div, _mask = read_level(bar, or_)
+            return cmd_probe(bar)
+        if a.pairs:
+            return cmd_pairs(bar)
+        if a.test:
+            return cmd_test(bar, int(a.test, 0), a.secs)
+
+        require_live(bar)
+        reg = int(a.reg, 0) if a.reg else duty_reg()
         if a.get:
-            print("%d%%" % cur)
+            print("%d%%" % get_pct(bar, reg))
         elif a.set is not None:
-            print("%d%%" % set_level(bar, or_, a.set))
+            print("%d%%" % set_pct(bar, reg, a.set))
         else:
-            print("%d%%" % set_level(bar, or_, cur + (a.step if a.up else -a.step)))
+            cur = get_pct(bar, reg)
+            print("%d%%" % set_pct(bar, reg, cur + (a.step if a.up else -a.step)))
     finally:
         bar.close()
 
