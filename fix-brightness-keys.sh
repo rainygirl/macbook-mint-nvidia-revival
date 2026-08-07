@@ -61,6 +61,14 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Read /proc/modules rather than piping lsmod into grep. `grep -q` exits on its first
+# match, which SIGPIPEs lsmod (141), and `set -o pipefail` then promotes that to the
+# pipeline's status -- so a *successful* match reports failure. Whether it bites depends
+# on how far into lsmod's output the match lands, so it fails for modules loaded late in
+# boot (nvidia) and not for early ones (video). grep on a file has no pipe and no race.
+mod_loaded() { grep -q "^$1 " /proc/modules 2>/dev/null; }
+yesno() { if "$@"; then echo yes; else echo no; fi; }
+
 log()  { printf '\n== %s\n' "$*"; }
 info() { printf '   %s\n' "$*"; }
 warn() { printf '   !! %s\n' "$*" >&2; }
@@ -104,16 +112,16 @@ else
 fi
 
 log "Graphics driver"
-if lsmod | grep -q '^nvidia '; then
+if mod_loaded nvidia; then
     info "nvidia module loaded (nouveau's nv_backlight is therefore gone -- expected)"
-elif lsmod | grep -q '^nouveau '; then
+elif mod_loaded nouveau; then
     info "nouveau loaded -- nv_backlight should exist; if it does not, the panel keys are"
     info "a desktop-side problem, not a driver one"
 else
     warn "neither nvidia nor nouveau is loaded"
 fi
-info "apple_bl loaded: $(lsmod | grep -qw apple_bl && echo yes || echo no)"
-info "video loaded:    $(lsmod | grep -qw '^video' && echo yes || echo no)"
+info "apple_bl loaded: $(yesno mod_loaded apple_bl)"
+info "video loaded:    $(yesno mod_loaded video)"
 
 log "xorg.conf brightness option"
 if [ ! -f "$XORG" ]; then
@@ -291,9 +299,13 @@ for d in /sys/class/backlight/*/; do
     chgrp video "$d/brightness" 2>/dev/null || true
     chmod g+w "$d/brightness" 2>/dev/null || true
 done
-if find_session_user && ! id -nG "$target_user" | tr ' ' '\n' | grep -qx video; then
-    usermod -aG video "$target_user"
-    info "added $target_user to the 'video' group (takes effect at next login)"
+if find_session_user; then
+    # Same pipefail/SIGPIPE trap as mod_loaded: no pipe, just a substring test.
+    case " $(id -nG "$target_user") " in
+        *" video "*) info "$target_user is already in the 'video' group" ;;
+        *) usermod -aG video "$target_user"
+           info "added $target_user to the 'video' group (takes effect at next login)" ;;
+    esac
 fi
 
 # ------------------------------------------------------------------ 5. helper + keys
