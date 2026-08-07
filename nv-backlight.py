@@ -52,8 +52,13 @@ NUM_OR = 4
 NVA3_DIV_OFFSET = 0x84
 ENABLE = 0x80000000
 USE_DIVISOR = 0x40000000
-DISPLAY_BLOCK = (0x61C000, 0x61E000)
-PMC_BLOCK = (0x001500, 0x001700)
+# The whole PDISPLAY aperture, not just the SOR sub-block: the first sweep assumed
+# nouveau's 0x61c880 and its +4 divisor, and both were wrong here.
+DISPLAY_BLOCK = (0x610000, 0x620000)
+PMC_BLOCK = (0x001000, 0x002000)
+# nv50 keeps the divisor next to the level; nva3 puts it 0x84 further on. Check both
+# rather than committing to one family.
+PAIR_OFFSETS = (0x04, 0x84)
 
 # Filled in by --test / set from a config file once confirmed.
 CONF = "/etc/nv-backlight.conf"
@@ -130,21 +135,25 @@ def require_live(bar):
 
 
 def find_pairs(bar, block):
-    """Registers X where X and X+4 share their low 16 bits and X+4 carries a high
-    control bit. That is the shape of a PWM (duty, enable|period) pair, and it is how
-    the working register was identified on this machine."""
+    """Registers X whose low 16 bits match those of X+off for one of PAIR_OFFSETS.
+
+    The panel is at full brightness, so on a PWM the duty equals the period and the two
+    words agree in their low half. Requiring a high control bit as well was too strict --
+    it is what made the first sweep miss everything -- so pairs are reported either way
+    and the ones carrying a control bit are flagged."""
     lo, hi = block
     out = []
     for reg in range(lo, hi, 4):
         a = bar.rd(reg)
-        b = bar.rd(reg + 4)
-        if not a or not b:
+        if not a or not (a & 0xFFFF):
             continue
-        if (a & 0xFFFF) != (b & 0xFFFF):
-            continue
-        if not (b & 0xF0000000):
-            continue
-        out.append((reg, a, b))
+        for off in PAIR_OFFSETS:
+            b = bar.rd(reg + off)
+            if not b:
+                continue
+            if (a & 0xFFFF) != (b & 0xFFFF):
+                continue
+            out.append((reg, off, a, b, bool((a | b) & 0xF0000000)))
     return out
 
 
@@ -167,88 +176,133 @@ def cmd_probe(bar):
     cmd_pairs(bar)
 
 
+def all_candidates(bar):
+    out = []
+    for block in (DISPLAY_BLOCK, PMC_BLOCK):
+        out.extend(find_pairs(bar, block))
+    # Registers carrying a control bit first: more likely to be the real PWM, and the
+    # sweep should reach them before the reader loses patience.
+    out.sort(key=lambda c: (not c[4], c[0]))
+    return out
+
+
 def cmd_pairs(bar):
     require_live(bar)
-    for name, block in (("display 0x61c000-0x61e000", DISPLAY_BLOCK),
-                        ("PMC 0x001500-0x001700", PMC_BLOCK)):
-        print("\nPWM-shaped register pairs in %s" % name)
-        pairs = find_pairs(bar, block)
-        if not pairs:
-            print("    none")
-            continue
-        for reg, a, b in pairs:
-            duty, period = a & 0xFFFF, b & 0xFFFF
-            pct = round(duty * 100 / period) if period else 0
-            print("    0x%06x = 0x%08x   0x%06x = 0x%08x   duty/period = %d/%d = %d%%"
-                  % (reg, a, reg + 4, b, duty, period, pct))
-        print("    -> confirm one with: sudo %s --test 0x%06x"
-              % (sys.argv[0], pairs[0][0]))
+    cands = all_candidates(bar)
+    print("\n%d candidate register pairs "
+          "(low 16 bits equal, i.e. duty == period at full brightness)\n" % len(cands))
+    if not cands:
+        print("    none")
+        return
+    print("  %-3s %-10s %-10s %-11s %-11s %s"
+          % ("#", "duty", "period", "duty val", "period val", "ctrl bit"))
+    for i, (reg, off, a, b, ctrl) in enumerate(cands):
+        print("  %-3d 0x%06x   0x%06x   0x%08x  0x%08x  %s"
+              % (i, reg, reg + off, a, b, "yes" if ctrl else ""))
+    print("\n  -> sudo %s --sweep      # tries each in turn, restoring every one"
+          % sys.argv[0])
 
 
-def cmd_test(bar, reg, secs):
-    """Drive a candidate and put it back. The original value is restored from a finally
-    block and from SIGINT/SIGTERM handlers, so Ctrl-C during the hold still restores.
-    These registers are volatile -- a reboot clears any mess regardless."""
-    require_live(bar)
-    orig = bar.rd(reg)
-    period = bar.rd(reg + 4) & 0xFFFF
-    print("0x%06x = 0x%08x   0x%06x = 0x%08x  (period %d)"
-          % (reg, orig, reg + 4, bar.rd(reg + 4), period))
+class Restorer:
+    """Puts a register back no matter how the process ends. Registered on SIGINT and
+    SIGTERM as well as in a finally block, so Ctrl-C mid-hold still restores. These
+    registers are volatile in any case -- a reboot clears anything left behind."""
+
+    def __init__(self, bar, reg):
+        self.bar, self.reg = bar, reg
+        self.orig = bar.rd(reg)
+        self.done = False
+        self.prev = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self.prev[sig] = signal.signal(sig, self._on_signal)
+
+    def _on_signal(self, *_a):
+        self.restore()
+        sys.exit(1)
+
+    def restore(self):
+        if not self.done:
+            self.bar.wr(self.reg, self.orig)
+            self.done = True
+        for sig, handler in self.prev.items():
+            signal.signal(sig, handler)
+
+
+def drive(bar, reg, off, pct, secs):
+    """Write one duty value, hold, then restore. Returns False if unusable."""
+    period = bar.rd(reg + off) & 0xFFFF
     if not period:
-        sys.exit("period at 0x%06x is 0 -- refusing to write" % (reg + 4))
-
-    restored = [False]
-
-    def restore(*_a):
-        if not restored[0]:
-            bar.wr(reg, orig)
-            restored[0] = True
-            print("\nrestored 0x%06x = 0x%08x" % (reg, orig))
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_a: (restore(), sys.exit(1)))
-
+        return False
+    r = Restorer(bar, reg)
     try:
-        print("\nWatch the panel. Each step is held %ds.\n" % secs)
-        for pct in (70, 40, 15):
-            val = (orig & ~0xFFFF) | int(period * pct / 100)
-            bar.wr(reg, val)
-            print("  %3d%%  wrote 0x%08x" % (pct, val))
-            time.sleep(secs)
+        bar.wr(reg, (r.orig & ~0xFFFF) | int(period * pct / 100))
+        time.sleep(secs)
     finally:
-        restore()
-
-    print("\nIf the panel dimmed and came back, this is the register.")
-    print("Record it with:  echo 'duty_reg=0x%06x' | sudo tee %s" % (reg, CONF))
-    print("If nothing changed, nothing was left altered -- try the next candidate.")
+        r.restore()
+    return True
 
 
-def duty_reg():
+def cmd_test(bar, reg, off, secs):
+    require_live(bar)
+    print("0x%06x = 0x%08x   period at 0x%06x = 0x%08x"
+          % (reg, bar.rd(reg), reg + off, bar.rd(reg + off)))
+    print("\nWatch the panel. Each step is held %ds.\n" % secs)
+    for pct in (70, 40, 15):
+        if not drive(bar, reg, off, pct, secs):
+            sys.exit("period at 0x%06x is 0 -- refusing to write" % (reg + off))
+        print("  %3d%%" % pct)
+    print("\nRestored. If the panel dimmed and came back, this is the register:")
+    print("  printf 'duty_reg=0x%06x\\nperiod_off=0x%02x\\n' | sudo tee %s"
+          % (reg, off, CONF))
+
+
+def cmd_sweep(bar, secs, start):
+    """Walk the candidates, dimming each one briefly. The reader watches the panel and
+    notes which index changed it -- far quicker than running --test by hand N times."""
+    require_live(bar)
+    cands = all_candidates(bar)
+    if not cands:
+        sys.exit("no candidates -- run --pairs")
+    cands = cands[start:]
+    print("Sweeping %d candidates, %ss each, dimming to 20%%." % (len(cands), secs))
+    print("Watch the panel and note the # that changes it. Ctrl-C is safe.\n")
+    for i, (reg, off, _a, _b, ctrl) in enumerate(cands, start):
+        ok = drive(bar, reg, off, 20, secs)
+        print("  #%-3d 0x%06x (period +0x%02x)%s%s"
+              % (i, reg, off, "  ctrl" if ctrl else "", "" if ok else "  skipped"))
+    print("\nAll restored. Confirm the one that worked:")
+    print("  sudo %s --test 0xADDR --off 0xNN" % sys.argv[0])
+
+
+def load_conf():
+    reg, off = DEFAULT_DUTY_REG, 0x04
     try:
         with open(CONF) as f:
             for line in f:
-                if line.strip().startswith("duty_reg="):
-                    return int(line.split("=", 1)[1].strip(), 0)
+                line = line.strip()
+                if line.startswith("duty_reg="):
+                    reg = int(line.split("=", 1)[1], 0)
+                elif line.startswith("period_off="):
+                    off = int(line.split("=", 1)[1], 0)
     except OSError:
         pass
-    return DEFAULT_DUTY_REG
+    return reg, off
 
 
-def get_pct(bar, reg):
-    period = bar.rd(reg + 4) & 0xFFFF
+def get_pct(bar, reg, off):
+    period = bar.rd(reg + off) & 0xFFFF
     if not period:
-        sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + 4))
+        sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + off))
     return round((bar.rd(reg) & 0xFFFF) * 100 / period)
 
 
-def set_pct(bar, reg, pct):
+def set_pct(bar, reg, off, pct):
     # Never 0: a black panel can only be undone by the very key being debugged.
     pct = max(5, min(100, int(pct)))
-    period = bar.rd(reg + 4) & 0xFFFF
+    period = bar.rd(reg + off) & 0xFFFF
     if not period:
-        sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + 4))
-    cur = bar.rd(reg)
-    bar.wr(reg, (cur & ~0xFFFF) | int(period * pct / 100))
+        sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + off))
+    bar.wr(reg, (bar.rd(reg) & ~0xFFFF) | int(period * pct / 100))
     return pct
 
 
@@ -257,34 +311,42 @@ def main():
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--probe", action="store_true", help="read-only survey")
     g.add_argument("--pairs", action="store_true", help="read-only: PWM-shaped pairs")
-    g.add_argument("--test", metavar="REG", help="drive a candidate, then restore it")
+    g.add_argument("--test", metavar="REG", help="drive one candidate, then restore it")
+    g.add_argument("--sweep", action="store_true", help="try every candidate in turn")
     g.add_argument("--get", action="store_true")
     g.add_argument("--set", type=int, metavar="PCT")
     g.add_argument("--up", action="store_true")
     g.add_argument("--down", action="store_true")
     p.add_argument("--step", type=int, default=10)
-    p.add_argument("--secs", type=int, default=3, help="hold per step for --test")
+    p.add_argument("--secs", type=float, default=3, help="hold per step")
+    p.add_argument("--from", dest="start", type=int, default=0,
+                   help="resume --sweep at this candidate index")
     p.add_argument("--reg", help="override the duty register (default from %s)" % CONF)
+    p.add_argument("--off", help="offset from duty to period register")
     a = p.parse_args()
 
     bar = Bar0(find_gpu())
     try:
+        conf_reg, conf_off = load_conf()
+        off = int(a.off, 0) if a.off else conf_off
         if a.probe:
             return cmd_probe(bar)
         if a.pairs:
             return cmd_pairs(bar)
         if a.test:
-            return cmd_test(bar, int(a.test, 0), a.secs)
+            return cmd_test(bar, int(a.test, 0), off, a.secs)
+        if a.sweep:
+            return cmd_sweep(bar, a.secs, a.start)
 
         require_live(bar)
-        reg = int(a.reg, 0) if a.reg else duty_reg()
+        reg = int(a.reg, 0) if a.reg else conf_reg
         if a.get:
-            print("%d%%" % get_pct(bar, reg))
+            print("%d%%" % get_pct(bar, reg, off))
         elif a.set is not None:
-            print("%d%%" % set_pct(bar, reg, a.set))
+            print("%d%%" % set_pct(bar, reg, off, a.set))
         else:
-            cur = get_pct(bar, reg)
-            print("%d%%" % set_pct(bar, reg, cur + (a.step if a.up else -a.step)))
+            cur = get_pct(bar, reg, off)
+            print("%d%%" % set_pct(bar, reg, off, cur + (a.step if a.up else -a.step)))
     finally:
         bar.close()
 
