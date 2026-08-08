@@ -293,6 +293,27 @@ def find_backlight():
     return None
 
 
+def mod_loaded(name):
+    try:
+        with open("/proc/modules") as f:
+            return any(line.split(" ", 1)[0] == name for line in f)
+    except OSError:
+        return False
+
+
+def boot_context():
+    """Say which boot this is. Without it, 'no backlight device' is ambiguous between
+    'the probe entry did not boot' and 'nouveau really provides no backlight', and those
+    lead in completely different directions."""
+    try:
+        with open("/proc/cmdline") as f:
+            cmdline = f.read().strip()
+    except OSError:
+        cmdline = ""
+    probe = "modprobe.blacklist=" in cmdline and "nvidia" in cmdline
+    return cmdline, probe, mod_loaded("nouveau"), mod_loaded("nvidia")
+
+
 def cmd_diff(bar):
     """Identify the backlight register by differencing, with a driver that already
     works, instead of guessing at nouveau's constants.
@@ -301,12 +322,26 @@ def cmd_diff(bar):
     register that moved on its own. PTIMER and the performance counters tick
     constantly and would otherwise swamp the real hit."""
     require_live(bar)
+    cmdline, probe, nouveau, nvidia = boot_context()
     dev = find_backlight()
     if not dev:
-        sys.exit("no /sys/class/backlight device.\n"
-                 "Boot with nouveau driving the GPU first -- this mode needs a working\n"
-                 "backlight to watch. See boot-nouveau-probe.sh --arm.")
-    print("watching %s" % dev)
+        print("no /sys/class/backlight device.\n")
+        print("  /proc/cmdline: %s\n" % cmdline)
+        print("  probe entry booted: %s" % ("yes" if probe else "NO"))
+        print("  nouveau loaded:     %s" % ("yes" if nouveau else "no"))
+        print("  nvidia loaded:      %s" % ("yes" if nvidia else "no"))
+        if not probe:
+            sys.exit("\nThis is the normal boot, not the probe one. Run\n"
+                     "  sudo ./boot-nouveau-probe.sh --arm && sudo reboot\n"
+                     "and do not touch any keys during boot -- it selects itself.")
+        if not nouveau:
+            sys.exit("\nThe probe entry booted but nouveau did not load. Check\n"
+                     "  dmesg | grep -i nouveau")
+        sys.exit("\nnouveau is driving the GPU and still registers no backlight.\n"
+                 "That is a real answer: the panel is not driven through the GPU on\n"
+                 "this machine, and the register hunt is over. Report this.")
+    print("watching %s   (nouveau=%s nvidia=%s probe-boot=%s)"
+          % (dev, nouveau, nvidia, probe))
     with open(os.path.join(dev, "max_brightness")) as f:
         maxb = int(f.read().strip())
     with open(os.path.join(dev, "brightness")) as f:
