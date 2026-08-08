@@ -62,7 +62,10 @@ PAIR_OFFSETS = (0x04, 0x84)
 
 # Filled in by --test / set from a config file once confirmed.
 CONF = "/etc/nv-backlight.conf"
-DEFAULT_DUTY_REG = 0x61C080
+# Confirmed by --diff under nouveau: 0x61c084 carries enable|duty and moves with
+# brightness; the period sits one word *behind* it, not ahead.
+DEFAULT_PERIOD_OFF = -0x04
+DEFAULT_DUTY_REG = 0x61C084
 
 
 def find_gpu():
@@ -392,12 +395,19 @@ def cmd_diff(bar, blocks=DIFF_BLOCKS):
         return
     print("\nNeighbours of each hit, to spot the period register:")
     for r, _b, _a in hits:
-        for off in (0x00, 0x04, 0x84):
-            print("    0x%06x+0x%02x = 0x%08x" % (r, off, bar.rd(r + off)))
+        for off in (-0x84, -0x04, 0x00, 0x04, 0x84):
+            print("    0x%06x %+#5x = 0x%08x" % (r, off, bar.rd(r + off)))
+
+
+def cmd_peek(bar, reg, count):
+    require_live(bar)
+    for i in range(count):
+        r = reg + i * 4
+        print("  0x%06x = 0x%08x   low16 %6d" % (r, bar.rd(r), bar.rd(r) & 0xFFFF))
 
 
 def load_conf():
-    reg, off = DEFAULT_DUTY_REG, 0x04
+    reg, off = DEFAULT_DUTY_REG, DEFAULT_PERIOD_OFF
     try:
         with open(CONF) as f:
             for line in f:
@@ -438,8 +448,10 @@ def main():
     g.add_argument("--diff", action="store_true",
                    help="find the register by changing a working backlight and "
                         "differencing (run this under nouveau)")
+    p.add_argument("--count", type=int, default=8, help="words for --peek")
     p.add_argument("--wide", action="store_true",
                    help="--diff over the full aperture; floods syslog with MMIO faults")
+    g.add_argument("--peek", metavar="REG", help="dump a window of registers")
     g.add_argument("--get", action="store_true")
     g.add_argument("--set", type=int, metavar="PCT")
     g.add_argument("--up", action="store_true")
@@ -464,6 +476,8 @@ def main():
             return cmd_test(bar, int(a.test, 0), off, a.secs)
         if a.sweep:
             return cmd_sweep(bar, a.secs, a.start)
+        if a.peek:
+            return cmd_peek(bar, int(a.peek, 0), a.count)
         if a.diff:
             return cmd_diff(bar, DIFF_BLOCKS_WIDE if a.wide else DIFF_BLOCKS)
 
