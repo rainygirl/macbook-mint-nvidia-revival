@@ -274,8 +274,16 @@ def cmd_sweep(bar, secs, start):
     print("  sudo %s --test 0xADDR --off 0xNN" % sys.argv[0])
 
 
-# Wide enough to cover PMC/PTIMER low registers and the whole PDISPLAY aperture.
-DIFF_BLOCKS = ((0x000000, 0x020000), (0x600000, 0x680000))
+# Kept deliberately small. Blanket-scanning 0x000000-0x020000 and 0x600000-0x680000 --
+# roughly 150k registers -- walks over a great deal of unimplemented MMIO, and nouveau
+# logs a bus fault for every such read. Under nvidia-340 those reads are silent, which is
+# why the first version looked harmless; under nouveau it floods syslog.
+#
+# The SOR block is where a panel PWM has to live on Tesla, so that is what gets scanned,
+# plus the handful of words around the pre-nv50 backlight register. --wide restores the
+# old behaviour if this ever comes up empty.
+DIFF_BLOCKS = ((0x61C000, 0x61E000), (0x0015F0, 0x001600))
+DIFF_BLOCKS_WIDE = ((0x000000, 0x020000), (0x600000, 0x680000))
 
 
 def snapshot(bar, blocks):
@@ -314,7 +322,7 @@ def boot_context():
     return cmdline, probe, mod_loaded("nouveau"), mod_loaded("nvidia")
 
 
-def cmd_diff(bar):
+def cmd_diff(bar, blocks=DIFF_BLOCKS):
     """Identify the backlight register by differencing, with a driver that already
     works, instead of guessing at nouveau's constants.
 
@@ -352,10 +360,13 @@ def cmd_diff(bar):
         with open(os.path.join(dev, "brightness"), "w") as f:
             f.write(str(v))
 
+    nregs = sum((hi - lo) // 4 for lo, hi in blocks)
+    print("scanning %d registers in %s"
+          % (nregs, ", ".join("0x%06x-0x%06x" % b for b in blocks)))
     print("\ncontrol pass (nothing changed) ...")
-    s0 = snapshot(bar, DIFF_BLOCKS)
+    s0 = snapshot(bar, blocks)
     time.sleep(0.5)
-    s1 = snapshot(bar, DIFF_BLOCKS)
+    s1 = snapshot(bar, blocks)
     noisy = {r for r in s0 if s0[r] != s1[r]}
     print("  %d registers move on their own; ignoring them" % len(noisy))
 
@@ -364,7 +375,7 @@ def cmd_diff(bar):
     try:
         set_b(low)
         time.sleep(0.5)
-        s2 = snapshot(bar, DIFF_BLOCKS)
+        s2 = snapshot(bar, blocks)
     finally:
         set_b(orig)
         print("restored brightness to %d" % orig)
@@ -376,7 +387,8 @@ def cmd_diff(bar):
         print("  0x%06x  0x%08x -> 0x%08x   (low16 %5d -> %5d)"
               % (r, before, after, before & 0xFFFF, after & 0xFFFF))
     if not hits:
-        print("  none -- the backlight is not driven through this BAR")
+        print("  none in this range -- retry with --wide (slow, and it makes nouveau")
+        print("  log an MMIO fault for every unimplemented address it touches)")
         return
     print("\nNeighbours of each hit, to spot the period register:")
     for r, _b, _a in hits:
@@ -426,6 +438,8 @@ def main():
     g.add_argument("--diff", action="store_true",
                    help="find the register by changing a working backlight and "
                         "differencing (run this under nouveau)")
+    p.add_argument("--wide", action="store_true",
+                   help="--diff over the full aperture; floods syslog with MMIO faults")
     g.add_argument("--get", action="store_true")
     g.add_argument("--set", type=int, metavar="PCT")
     g.add_argument("--up", action="store_true")
@@ -451,7 +465,7 @@ def main():
         if a.sweep:
             return cmd_sweep(bar, a.secs, a.start)
         if a.diff:
-            return cmd_diff(bar)
+            return cmd_diff(bar, DIFF_BLOCKS_WIDE if a.wide else DIFF_BLOCKS)
 
         require_live(bar)
         reg = int(a.reg, 0) if a.reg else conf_reg
