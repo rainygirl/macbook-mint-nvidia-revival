@@ -13,7 +13,11 @@
 | 스크립트 | 역할 |
 | --- | --- |
 | `fix-nvidia-340.sh` | `nvidia-340` 패키지 설치를 완료시킴 |
-| `fix-brightness-keys.sh` | 드라이버 교체 후 죽은 F1/F2 밝기 키 복구 |
+| `install-mcp89-backlight.sh` | 드라이버 교체 후 죽은 F1/F2 밝기 키 복구 |
+| `fix-screen-blank.sh` | 유휴 시간 후 화면이 꺼지게 함 |
+| `nv-backlight.py` | 백라이트 레지스터를 찾고 조작하는 유저스페이스 도구 (진단용) |
+| `boot-nouveau-probe.sh` | 비교 대조군으로 nouveau를 한 번만 부팅 |
+| `fix-brightness-keys.sh` | 대체됨 -- 진단과 `--revert` 때문에 남겨둠 |
 | `set-mac-boot-splash.sh` | 맥 스타일 부팅 화면 + 부팅 시간 단축 |
 | `get-mint-iso.sh` | 가장 빠른 미러에서 Mint ISO 다운로드 |
 
@@ -39,31 +43,87 @@ Command 레지스터를 세팅하는 GRUB `setpci` 명령을 내보냅니다. �
 
 root로 실행. 커널마다 모듈을 빌드하므로 5~10분 걸립니다.
 
-## `fix-brightness-keys.sh`
+## `install-mcp89-backlight.sh`
 
 nouveau가 nvidia-340으로 바뀌면 F1/F2가 밝기를 못 바꿉니다. 키가 죽은 게 아니라 키가 조작할
 대상이 사라진 것입니다. nouveau의 KMS 드라이버는 `/sys/class/backlight/nv_backlight`를
 등록하고 xfce4-power-manager가 거기에 직접 씁니다. nvidia-340은 nouveau를 블랙리스트에 넣고
-대신 KMS 없는 DRM 노드를 등록합니다 -- plymouth의 drm 렌더러가 실패하는 것과 같은 이유입니다.
-그래서 `nv_backlight`가 없어지고, 대신 들어오는 것도 없어서 데스크톱에 backlight 장치가 하나도
-남지 않습니다.
+KMS 없는 DRM 노드를 등록하므로 backlight 장치가 하나도 남지 않습니다.
 
-340.108도 `/sys/class/backlight/nvidia_backlight`를 만들 수 있지만 Device 섹션에
-`Option "RegistryDwords" "EnableBrightnessControl=1"`이 있어야 합니다. 패키지에도,
-`set-mac-boot-splash.sh`가 `LogoPath`/`NoLogo` 때문에 쓰는 `xorg.conf`에도 그게 없습니다. 이
-스크립트는 *Screen*이 참조하는 Device 섹션에 그것을 넣습니다 -- 두 번째 Device 섹션은
-`GPUDevice`로 강등되어 옵션이 아예 읽히지 않습니다.
+그럴듯한 경로 세 가지가 전부 막다른 길이고, 스크립트는 그것들을 제거합니다:
 
-같이 하는 일: `apple_bl` 로드(커널 내장 nvidia-bl. 어느 X 드라이버가 GPU를 잡고 있든 mmio로
-320M 패널을 직접 다루고, `xorg.conf` 변경과 달리 X 재시작 없이 바로 먹습니다), udev로
-`brightness` 파일을 그룹 쓰기 가능하게(두 노드 모두 `0644 root:root`로 올라오는데, `EACCES`로
-실패한 쓰기는 죽은 키와 구분이 안 됩니다), xfce4-power-manager가 그래도 장치를 안 받을 때를
-위해 `mac-brightness`를 `XF86MonBrightnessUp/Down`에 바인딩, 그리고 F1이 밝기 키심을 내보내는지
-자체를 결정하는 `hid_apple`의 `fnmode` 확인.
+- **nvidia-340 자체의 백라이트.** 없습니다. `strings nvidia_drv.so`에 나오는 건
+  `%s/%s/brightness`, `Unable to find the brightness file path under`,
+  `EnableACPIBrightnessHotkeys`뿐입니다 - *읽기만* 하고 만들지 않습니다.
+  `EnableBrightnessControl`이라는 문자열은 없습니다. `RegistryDwords`는 모르는 키를 조용히
+  무시하고, Xorg 로그의 `(**)`는 "사용자가 지정함"이지 "드라이버가 이해함"이 아닙니다.
+- **`apple_bl`.** 이 기기에 있는 `APP0002`에 매칭되고, MCP89 호스트 브리지라 nvidia 경로도
+  맞습니다. 그런데 `apple_bl_add()`는 마지막에 레거시 I/O 포트 `0x52f`로 하드웨어 응답을
+  확인하고, 응답이 없으면 **로그 한 줄 없이** `-ENODEV`로 빠집니다. "this may not work under
+  EFI"라는 자체 주석이 붙어 있고, 이 맥은 EFI로 부팅합니다. `acpi_backlight=vendor`는
+  무관합니다 - 거기까지 가지도 못합니다.
+- **`acpi_video`.** `acpi_backlight=` 유무와 관계없이 이 기기에선 아무것도 등록하지 않습니다.
 
-`--diagnose`는 상태만 출력하고 아무것도 바꾸지 않습니다 (root 불필요). ACPI video 드라이버가
-backlight를 쥐고 `apple_bl`에 안 넘길 때는 `--acpi-vendor`로 `acpi_backlight=vendor`를
-추가합니다. `--revert`로 전부 되돌립니다.
+그래서 모듈이 PWM을 직접 제어합니다. 레지스터는 nouveau 헤더에서 베낀 게 아닙니다 - nouveau의
+Tesla 상수는 `0x61c880`에 divisor `+0x84`인데 여기선 둘 다 0입니다. nouveau로 부팅해
+`nv_backlight`를 바꾸면서 BAR를 차분해서 찾았습니다 (`nv-backlight.py --diff`):
+
+    0x61c080   period. 읽기만 하고 쓰지 않음 (nouveau 2966, nvidia-340 24557)
+    0x61c084   bit 31  write-only 래치. 없이 쓰면 값은 저장되지만 PWM에 안 닿음.
+                       읽기는 이미 nv_backlight와 일치했는데 쓰기만 안 먹던 이유
+               bit 30  하드웨어가 유지
+               bits 0. duty
+
+밝기는 그 시점 period에 대한 백분율로 계산하므로, period가 서로 다른 두 드라이버에서 같은
+코드가 동작합니다.
+
+결과물은 `/sys/class/backlight/mcp89_backlight`입니다. `nv_backlight`가 있던 시절과 똑같이
+xfce4-power-manager가 F1/F2를 직접 처리합니다 - 커스텀 키 바인딩도, 헬퍼도, sudo도 없습니다.
+DKMS `AUTOINSTALL`이라 커널 업데이트마다 자동 재빌드되며, nvidia-340과 같은 방식입니다.
+`PMC_BOOT_0`의 칩셋이 `0xaf`가 아니면 로드를 거부하고, nouveau가 GPU를 잡고 있으면 물러납니다.
+
+`--uninstall`로 되돌립니다.
+
+## `fix-screen-blank.sh`
+
+유휴 상태에서 화면이 안 꺼지는 원인은 `xscreensaver`입니다. 자기 `dpmsEnabled`가 False면
+`xset -dpms`를 실행합니다 - `xset q`에 타임아웃 값은 멀쩡한데 `DPMS is Disabled`가 같이 나오는
+상태가 그것입니다. xfce4-power-manager 타이머만 고쳐봐야 xscreensaver가 다음에 자기 설정을
+적용할 때 되돌립니다. 그래서 `~/.xscreensaver`를 먼저 고치고, 그 다음 xfconf 키를 맞추고,
+마지막에 `xset +dpms`로 어느 데몬도 기다리지 않고 즉시 적용합니다.
+
+`--diagnose`는 아무것도 바꾸지 않고 root도 필요 없습니다. `--test`는 DPMS를 즉시 끕니다 -
+"드라이버가 이 패널을 블랭킹 못 한다"와 "유휴 타이머가 안 돈다"를 가르는 유일한 방법입니다.
+설정을 아무리 읽어도 이건 구분되지 않습니다.
+
+## `nv-backlight.py`
+
+위 레지스터를 찾아낸 도구입니다. 다른 칩에서 다시 찾을 때 쓰는 방법 자체라 남겨둡니다.
+`--probe`는 BAR0을 읽기 전용으로 훑고 `PMC_BOOT_0`으로 매핑이 살아있음을 증명합니다.
+`--pairs`는 상수를 믿는 대신 PWM 쌍의 *모양*을 찾습니다. `--sweep`은 후보를 하나씩 잠깐
+구동하고 전부 복원합니다. `--diff`가 결론을 낸 것으로, 동작하는 백라이트가 있는 상태에서
+밝기를 바꾸고 어느 레지스터가 따라 움직였는지 보고합니다. 저절로 움직이는 것은 대조 패스로
+걸러냅니다.
+
+BAR0 접근은 `/sys/bus/pci/devices/<addr>/resource0`을 통하므로 `/dev/mem`이 필요 없고
+`iomem=strict`의 영향도 받지 않습니다. 읽고 쓰기는 Python 슬라이싱이 아니라 ctypes `uint32`
+배열로 합니다 - 슬라이싱은 `memcpy`로 복사하는데 바이트 단위 로드를 써도 되는 반면 MMIO는
+정렬된 32비트 접근이 필요합니다.
+
+## `boot-nouveau-probe.sh`
+
+같은 커널을 `modprobe.blacklist=nvidia,...`로 한 번만 부팅해 nouveau가 GPU를 잡게 하는 GRUB
+항목을 추가합니다. GRUB 메뉴는 띄우지 않습니다 - `09_enable_vga`의 setpci 쓰기가 grub.cfg
+파싱 중에 실행되고, 그 이후 GRUB은 스캔아웃되지 않는 프레임버퍼에 그리기 때문에 "보이는"
+메뉴는 실제로는 *보이지 않는* 프롬프트이고 아무 키나 누르면 거기서 멈춥니다. 대신
+`grub-editenv set next_entry`로 미리 선택합니다. 00_header가 생성하는 전처리부가 이것을 읽고
+스스로 지우면서 부팅하므로, 일회성이고 자기소멸적이며 전원을 껐다 켜면 원래대로 돌아옵니다.
+
+## `fix-brightness-keys.sh`
+
+첫 시도였고 `install-mcp89-backlight.sh`로 대체됐습니다. 후자가 이 스크립트의 `--revert`를
+호출해 설정을 되돌립니다. `--diagnose`는 backlight 장치, 드라이버 상태, `apple_bl` 바인드
+결과, `hid_apple`의 `fnmode`를 한 번에 보여줘서 여전히 가장 빠른 확인 수단입니다.
 
 ## `set-mac-boot-splash.sh`
 

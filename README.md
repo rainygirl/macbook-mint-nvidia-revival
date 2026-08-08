@@ -13,7 +13,11 @@ Everything they change is backed up and reversible.
 | Script | Role |
 | --- | --- |
 | `fix-nvidia-340.sh` | Makes the `nvidia-340` package finish installing |
-| `fix-brightness-keys.sh` | Restores the F1/F2 panel-brightness keys after the driver switch |
+| `install-mcp89-backlight.sh` | Restores the F1/F2 panel-brightness keys after the driver switch |
+| `fix-screen-blank.sh` | Makes the panel switch off after an idle period |
+| `nv-backlight.py` | Finds and drives the backlight register from userspace (diagnostic) |
+| `boot-nouveau-probe.sh` | Boots nouveau once, to compare against |
+| `fix-brightness-keys.sh` | Superseded -- kept for its diagnostics and its `--revert` |
 | `set-mac-boot-splash.sh` | Mac-style boot screen, and boot-time reductions |
 | `get-mint-iso.sh` | Downloads a Mint ISO from the fastest mirror |
 
@@ -40,32 +44,93 @@ rendering into a framebuffer that is no longer scanned out.
 
 Run as root. Takes 5-10 minutes — it builds the module for each kernel.
 
-## `fix-brightness-keys.sh`
+## `install-mcp89-backlight.sh`
 
 F1/F2 stop dimming the panel once nvidia-340 replaces nouveau. The keys are fine; what
 disappears is the thing they act on. nouveau's KMS driver registers
 `/sys/class/backlight/nv_backlight` and xfce4-power-manager writes to it directly.
-nvidia-340 blacklists nouveau and registers a KMS-less DRM node instead — the same
-property that makes plymouth's drm renderer fail — so there is no `nv_backlight`, nothing
-replaces it, and the desktop ends up with no backlight device at all.
+nvidia-340 blacklists nouveau and registers a KMS-less DRM node instead, so no backlight
+device exists at all and the keypress has nowhere to go.
 
-340.108 can expose `/sys/class/backlight/nvidia_backlight`, but only with
-`Option "RegistryDwords" "EnableBrightnessControl=1"` in the Device section. Neither the
-package nor the `xorg.conf` that `set-mac-boot-splash.sh` writes for `LogoPath`/`NoLogo`
-includes it. This script adds it to the Device section the *Screen* references — a second
-Device section is demoted to `GPUDevice` and its options are never read.
+Three obvious routes are all dead ends here, and the script removes each one:
 
-It also loads `apple_bl` (the in-tree nvidia-bl; it drives the 320M panel over mmio
-regardless of which X driver owns the GPU, and unlike the `xorg.conf` change it takes
-effect without restarting X), makes the `brightness` file group-writable through udev
-(both nodes come up `0644 root:root`, and a write that fails with `EACCES` is
-indistinguishable from a dead key), installs `mac-brightness` bound to
-`XF86MonBrightnessUp/Down` for when xfce4-power-manager still refuses the device, and
-checks `hid_apple`'s `fnmode`, which decides whether F1 emits the brightness keysym at all.
+- **nvidia-340's own backlight.** There isn't one. `strings nvidia_drv.so` shows only
+  `%s/%s/brightness`, `Unable to find the brightness file path under` and
+  `EnableACPIBrightnessHotkeys` -- it *reads* a backlight, it never creates one. There is
+  no `EnableBrightnessControl`; `RegistryDwords` silently ignores unknown keys, and
+  Xorg.0.log's `(**)` only means the option was specified, not understood.
+- **`apple_bl`.** It matches `APP0002`, which this machine has, and its nvidia path is
+  right for an MCP89 host bridge. But `apple_bl_add()` ends with a live-hardware check on
+  legacy I/O port `0x52f` and returns `-ENODEV` *with no log message* when that port does
+  not answer. Its own comment says "this may not work under EFI", which is how this Mac
+  boots. `acpi_backlight=vendor` does not help: it never gets that far.
+- **`acpi_video`.** Registers nothing on this machine either, with or without
+  `acpi_backlight=`.
 
-`--diagnose` reports the state and changes nothing, no root needed. `--acpi-vendor` adds
-`acpi_backlight=vendor` if the ACPI video driver is holding the backlight away from
-`apple_bl`. `--revert` undoes everything.
+So the module drives the PWM directly. The registers were not taken from nouveau's
+headers -- nouveau's Tesla constant is `0x61c880` with the divisor at `+0x84`, and both
+read 0 here. They were found by booting nouveau, changing `nv_backlight`, and diffing the
+BAR (`nv-backlight.py --diff`):
+
+    0x61c080   period, read and never written (2966 under nouveau, 24557 under nvidia-340)
+    0x61c084   bit 31  write-only latch; a write without it stores the word but never
+                       reaches the PWM -- which is why reads already agreed with
+                       nv_backlight while writes did nothing
+               bit 30  maintained by the hardware
+               bits 0. duty
+
+Brightness is a percentage of whatever period the register currently holds, so the same
+code works under either driver despite the two different periods.
+
+The result is `/sys/class/backlight/mcp89_backlight`, so xfce4-power-manager handles
+F1/F2 itself exactly as it did with `nv_backlight` -- no custom key bindings, no helper,
+no sudo. DKMS `AUTOINSTALL` rebuilds it across kernel updates, the same mechanism
+nvidia-340 uses. It refuses to load unless `PMC_BOOT_0` reports chipset `0xaf`, and backs
+off if nouveau owns the GPU.
+
+Undo with `--uninstall`.
+
+## `fix-screen-blank.sh`
+
+The panel never blanks on idle because `xscreensaver` runs `xset -dpms` whenever its own
+`dpmsEnabled` is False -- `xset q` shows populated timeouts next to `DPMS is Disabled`.
+Setting xfce4-power-manager's timers alone does nothing; xscreensaver undoes it on its
+next apply. So `~/.xscreensaver` is fixed first, then the matching xfconf keys, then
+`xset +dpms` to take effect without waiting for either daemon.
+
+`--diagnose` reports without changing anything and needs no root. `--test` forces DPMS
+off immediately, which separates "the driver cannot blank this panel" from "the idle
+timer never fires" -- no amount of reading settings does that.
+
+## `nv-backlight.py`
+
+The tool that found the register above, kept because it is how to find it again on a
+different part. `--probe` surveys BAR0 read-only and proves the mapping is live via
+`PMC_BOOT_0`. `--pairs` looks for the *shape* of a PWM pair rather than trusting a
+constant. `--sweep` drives each candidate briefly, restoring every one. `--diff` is the
+one that settled it: with a working backlight present it changes brightness and reports
+which registers moved, discarding those that move on their own.
+
+It reaches BAR0 through `/sys/bus/pci/devices/<addr>/resource0`, which needs no
+`/dev/mem` and is not subject to `iomem=strict`, and goes through a ctypes `uint32` array
+rather than Python slicing -- slicing copies via `memcpy`, which may use byte-sized loads,
+and MMIO wants aligned 32-bit accesses.
+
+## `boot-nouveau-probe.sh`
+
+Adds a GRUB entry that boots the same kernel with `modprobe.blacklist=nvidia,...` so
+nouveau can drive the GPU for one boot. It does not show the GRUB menu: `09_enable_vga`'s
+setpci writes run while grub.cfg is parsed, and after them GRUB renders into a
+framebuffer that is no longer scanned out, so a visible menu is an *invisible* prompt that
+any keypress freezes. The entry is selected in advance with `grub-editenv set next_entry`,
+which 00_header's preamble consumes and clears as it boots -- one shot, self-cancelling,
+and a power-cycle is enough to get back.
+
+## `fix-brightness-keys.sh`
+
+The first attempt, superseded by `install-mcp89-backlight.sh`, which calls its `--revert`
+to undo what it set. Its `--diagnose` is still the quickest way to see backlight devices,
+driver state, `apple_bl` bind status and `hid_apple`'s `fnmode` in one place.
 
 ## `set-mac-boot-splash.sh`
 
