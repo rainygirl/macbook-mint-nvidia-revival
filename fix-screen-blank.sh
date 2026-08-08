@@ -107,13 +107,28 @@ else
 fi
 
 log "Idle/blanking daemons"
+running_xscreensaver=0
 for p in xfce4-power-manager xfce4-screensaver light-locker xscreensaver; do
-    if pgrep -u "$target_user" -x "$p" >/dev/null 2>&1; then
+    # The kernel truncates comm to 15 characters, so "xfce4-power-manager" appears as
+    # "xfce4-power-man" and a pgrep -x on the full name misses a process that is running.
+    if pgrep -u "$target_user" -x "$(printf '%.15s' "$p")" >/dev/null 2>&1; then
         info "$p: running"
+        [ "$p" = xscreensaver ] && running_xscreensaver=1
     elif command -v "$p" >/dev/null 2>&1; then
         info "$p: installed, not running"
     fi
 done
+if [ "$running_xscreensaver" = 1 ]; then
+    xsconf=$(getent passwd "$target_user" | cut -d: -f6)/.xscreensaver
+    info ""
+    info "xscreensaver manages blanking itself and turns the X DPMS extension off"
+    info "whenever its own dpmsEnabled is False -- that is what disables DPMS here."
+    if [ -f "$xsconf" ]; then
+        grep -E '^(timeout|lock|mode|dpms)' "$xsconf" | sed 's/^/     /' || true
+    else
+        info "$xsconf does not exist yet (built-in defaults, dpmsEnabled off)"
+    fi
+fi
 
 log "Inhibitors"
 if command -v systemd-inhibit >/dev/null 2>&1; then
@@ -141,10 +156,41 @@ if [ "$MODE" = test ]; then
 fi
 
 # ---------------------------------------------------------------------- apply
-# xfce4-power-manager owns these timers and reapplies them over anything xset does, so
-# they are set there rather than with `xset dpms`. Values are in minutes.
 SLEEP_MIN=$MINUTES
 OFF_MIN=$((MINUTES + 1))
+
+hms() {   # minutes -> H:MM:SS, the format xscreensaver's config uses
+    printf '%d:%02d:00' $(($1 / 60)) $(($1 % 60))
+}
+
+# xscreensaver first: it is the one that ran `xset -dpms`, and anything set below would
+# be undone the next time it reapplies its own preferences.
+if [ "$running_xscreensaver" = 1 ]; then
+    log "xscreensaver: enabling DPMS in its own config"
+    xshome=$(getent passwd "$target_user" | cut -d: -f6)
+    xsconf=$xshome/.xscreensaver
+    [ -f "$xsconf" ] || { : > "$xsconf"; chown "$target_user": "$xsconf"; }
+    cp -n "$xsconf" "$xsconf.bak" 2>/dev/null || true
+
+    xs_set() {   # key value
+        if grep -qE "^$1:" "$xsconf"; then
+            sed -i "s|^$1:.*|$1:\t$2|" "$xsconf"
+        else
+            printf '%s:\t%s\n' "$1" "$2" >> "$xsconf"
+        fi
+        info "$1 = $2"
+    }
+    xs_set timeout      "$(hms "$SLEEP_MIN")"
+    xs_set dpmsEnabled  True
+    xs_set dpmsStandby  "$(hms "$SLEEP_MIN")"
+    xs_set dpmsSuspend  "$(hms "$SLEEP_MIN")"
+    xs_set dpmsOff      "$(hms "$OFF_MIN")"
+    chown "$target_user": "$xsconf"
+
+    # It only re-reads preferences on restart.
+    as_user xscreensaver-command -restart >/dev/null 2>&1 \
+        || info "could not restart xscreensaver; log out and back in to apply"
+fi
 
 log "Setting the idle timeouts to $MINUTES minutes"
 xfconf_set /xfce4-power-manager/dpms-enabled           bool  true
@@ -157,6 +203,13 @@ xfconf_set /xfce4-power-manager/blank-on-ac            uint  "$SLEEP_MIN"
 xfconf_set /xfce4-power-manager/blank-on-battery       uint  "$SLEEP_MIN"
 # Presentation mode suppresses all of the above and is easy to leave on by accident.
 xfconf_set /xfce4-power-manager/presentation-mode      bool  false
+
+# Turn the extension back on and seed the timers now, so this takes effect without
+# waiting for either daemon to reapply its settings.
+log "Re-enabling DPMS on the running server"
+as_user xset +dpms
+as_user xset dpms $((SLEEP_MIN * 60)) $((SLEEP_MIN * 60)) $((OFF_MIN * 60))
+as_user xset s $((SLEEP_MIN * 60)) $((SLEEP_MIN * 60))
 
 log "Result (xset q)"
 as_user xset q 2>/dev/null | sed -n '/DPMS/,$p' | sed 's/^/     /' || true
