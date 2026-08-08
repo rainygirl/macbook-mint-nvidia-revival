@@ -52,6 +52,11 @@ NUM_OR = 4
 NVA3_DIV_OFFSET = 0x84
 ENABLE = 0x80000000
 USE_DIVISOR = 0x40000000
+# Writes must carry ENABLE. It reads back as 0, so it is a latch trigger rather than a
+# state bit: storing a new duty without it updates the word but never reaches the PWM.
+# That is why --get already agreed with nv_backlight while --set changed nothing.
+# nouveau does the same -- nv50/nva3_set_intensity write `val | ENABLE` and nothing else.
+LEVEL_MASK = 0x00FFFFFF
 # The whole PDISPLAY aperture, not just the SOR sub-block: the first sweep assumed
 # nouveau's 0x61c880 and its +4 divisor, and both were wrong here.
 DISPLAY_BLOCK = (0x610000, 0x620000)
@@ -225,7 +230,9 @@ class Restorer:
 
     def restore(self):
         if not self.done:
-            self.bar.wr(self.reg, self.orig)
+            # ENABLE again: without the latch bit the restore would not reach the PWM
+            # either, and the panel would stay at the test level.
+            self.bar.wr(self.reg, ENABLE | (self.orig & LEVEL_MASK))
             self.done = True
         for sig, handler in self.prev.items():
             signal.signal(sig, handler)
@@ -233,12 +240,12 @@ class Restorer:
 
 def drive(bar, reg, off, pct, secs):
     """Write one duty value, hold, then restore. Returns False if unusable."""
-    period = bar.rd(reg + off) & 0xFFFF
+    period = bar.rd(reg + off) & LEVEL_MASK
     if not period:
         return False
     r = Restorer(bar, reg)
     try:
-        bar.wr(reg, (r.orig & ~0xFFFF) | int(period * pct / 100))
+        bar.wr(reg, ENABLE | (int(period * pct / 100) & LEVEL_MASK))
         time.sleep(secs)
     finally:
         r.restore()
@@ -422,19 +429,21 @@ def load_conf():
 
 
 def get_pct(bar, reg, off):
-    period = bar.rd(reg + off) & 0xFFFF
+    period = bar.rd(reg + off) & LEVEL_MASK
     if not period:
         sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + off))
-    return round((bar.rd(reg) & 0xFFFF) * 100 / period)
+    return round((bar.rd(reg) & LEVEL_MASK) * 100 / period)
 
 
 def set_pct(bar, reg, off, pct):
     # Never 0: a black panel can only be undone by the very key being debugged.
     pct = max(5, min(100, int(pct)))
-    period = bar.rd(reg + off) & 0xFFFF
+    period = bar.rd(reg + off) & LEVEL_MASK
     if not period:
         sys.exit("period at 0x%06x is 0 -- run --pairs" % (reg + off))
-    bar.wr(reg, (bar.rd(reg) & ~0xFFFF) | int(period * pct / 100))
+    # Exactly what nouveau writes: ENABLE plus the level, nothing carried over. The other
+    # high bits read back set on their own, so the hardware maintains them.
+    bar.wr(reg, ENABLE | (int(period * pct / 100) & LEVEL_MASK))
     return pct
 
 
